@@ -1,0 +1,765 @@
+---
+title: "Customer Personality Analysis"
+author: "Michael Czuba"
+date: "2024-06-16"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+# Purpose
+
+Customer Personality Analysis is an essential tool for businesses aiming to understand and segment their customer base effectively. It involves a comprehensive examination of customers' preferences, behaviors, and demographic characteristics, which allows companies to tailor their products and marketing strategies to meet the specific needs of different customer segments. This approach not only enhances customer satisfaction but also optimizes marketing expenditures by targeting the most receptive audience.  
+
+In this analysis, K-Means and Association Rules will be used.
+
+
+# About the Data
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(corrplot)
+library(caret)
+library(arules)
+library(arulesViz)
+library(factoextra)
+library(cluster)
+library(ggplot2)
+library(scales)
+library(reshape2)
+library(clValid)
+options(scipen=999)
+
+data=read.table("C:\\Users\\Michael\\OneDrive\\Documents\\MSBA\\Applied ML\\Project\\marketing_campaign.csv", sep = "\t", header = T)
+dt=data.frame(data)
+```
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+str(dt)
+```
+Upon initially reviewing the data set, we can see that we need to address our features' data types. Below is an initial list of the features that need to be revised:
+
+* Birth year should be transformed into an age feature and should be binned
+* Education level should be factorized
+* Marital status should be factorized
+* Income should be numeric
+* Dt_Customer should be transformed into a feature that describes how long a customer has been doing business with the company
+* AcceptedCmp1-AcceptedCmp5 should be binary (yes accepted/no did not accept)
+* Complain should be made binary (yes complain/ no did not complain)
+* Response should be made binary (yes respond/ no did not respond)
+* Kidhome and Teenhome should be factorized
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+# Birth Year to Age
+current_year <- as.numeric(format(Sys.Date(), "%Y"))
+dt$Age <- current_year - dt$Year_Birth
+dt<- dt[,-2]
+
+IQR <- quantile(dt$Age, 0.75) - quantile(dt$Age, 0.25)
+binwidth <- 2 * IQR / length(dt$Age)^(1/3)
+
+#Education
+dt$Education<-as.factor(dt$Education)
+
+#Marital Status
+dt$Marital_Status<-as.factor(dt$Marital_Status)
+
+#Income
+dt$Income<-as.numeric(dt$Income)
+
+#Dt_Customer -> Customer Duration
+current_date<-Sys.Date()
+dt$Dt_Customer <- as.Date(dt$Dt_Customer, format = "%d-%m-%Y")
+dt$Dt_Customer <- format(dt$Dt_Customer, "%Y-%m-%d")
+dt$Dt_Customer <- as.Date(dt$Dt_Customer)
+dt$Customer_Duration <- as.numeric(difftime(current_date, dt$Dt_Customer, units = "days")) / 365.25
+dt<- dt[,-7]
+
+# AcceptedCmp1-5
+dt$AcceptedCmp1<-as.factor(dt$AcceptedCmp1)
+dt$AcceptedCmp2<-as.factor(dt$AcceptedCmp2)
+dt$AcceptedCmp3<-as.factor(dt$AcceptedCmp3)
+dt$AcceptedCmp4<-as.factor(dt$AcceptedCmp4)
+dt$AcceptedCmp5<-as.factor(dt$AcceptedCmp5)
+
+# Complain
+dt$Complain<-as.factor(dt$Complain)
+
+# Response
+dt$Response<-as.factor(dt$Response)
+```
+After making these changes, redundancy within some of the features is apparent, listed below:
+
+Additionally, some new features were created. Age was derived from Birth year and Customer Duration was derived from their Customer Date. 
+
+To see if there are missing values:
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+colSums(is.na(dt))
+```
+
+According to the R output above, there are 24 missing values in the Income feature. Due to having a large volume of observations, the 24 records containing missing data will be removed.
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message=TRUE}
+#Visualization of percentage of missing Income values
+missing.values <- dt %>%
+  gather(key = "key", value = "val") %>%
+  mutate(isna = is.na(val)) %>%
+  group_by(key) %>%
+  mutate(total = n()) %>%
+  group_by(key, total, isna) %>%
+  summarise(num.isna = n()) %>%
+  mutate(pct = num.isna / total * 100)
+
+levels =(missing.values  %>% filter(isna == T) %>% arrange(desc(pct)))$key
+
+percentage.plot = missing.values %>%
+      ggplot() +
+        geom_bar(aes(x = reorder(key, desc(pct)), 
+                     y = pct, fill=isna), 
+                 stat = 'identity', alpha=0.8) +
+      scale_x_discrete(limits = levels) +
+      scale_fill_manual(name = "", 
+                        values = c('#adcae6', 'red'), labels = c("Present", "Missing")) +
+      coord_flip() +
+      labs(title = "Percentage of missing values", x ='Variable', y = "% of missing values")
+percentage.plot
+
+dt <- dt[complete.cases(dt$Income),]
+sum(is.na(dt$Income))
+```
+After removal of incomplete records,  the total number of observations drops from 2240 to 2216.
+
+
+# Exploratory Data Analysis
+
+In order to accurately cluster, variables will be evaluated and records with outliers will be removed. Additionally, any oddities in categorical data will be removed. Lastly, all numeric data will be preprocessed for center and scaling to minimize the effects larger scales have on clustering algorithms.
+
+## Age
+
+There seems to be a few outliers in our Age feature.
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+ggplot(dt, aes(x = Age)) +
+  geom_histogram(color = "black", fill = "skyblue", alpha = 0.7) +
+  labs(title = "Distribution of Age",
+       x = "Age",
+       y = "Frequency")
+
+boxplot(dt$Age)
+```
+
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+Q1 <- quantile(dt$Age, 0.25)
+Q3 <- quantile(dt$Age, 0.75)
+
+IQR <- Q3 - Q1
+
+# Define the lower and upper bounds for outliers
+lower_bound <- Q1 - 1.5 * IQR
+upper_bound <- Q3 + 1.5 * IQR
+
+# Filter out outliers from the dataset
+dt <- dt[dt$Age >= lower_bound & dt$Age <= upper_bound, ]
+```
+
+Re-run the histogram and the boxplot to visualize changes
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+ggplot(dt, aes(Age)) +
+  geom_histogram(color = "black", fill = "skyblue", alpha = 0.7) +
+  labs(title = "Distribution of Age",
+       x = "Age",
+       y = "Frequency")
+
+boxplot(dt$Age)
+```
+Age is now more normally distributed and the boxplot indicates that there are no more outliers.
+
+## Education
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+ggplot(data = dt, aes(x = Education)) +
+  geom_bar(fill = 'seagreen') +
+  theme_minimal() +
+  labs(
+    title = "Bar Plot of Education",
+    ylab = "Count",
+    fill = "Education"
+  )
+```
+
+## Marital Status
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+ggplot(data = dt, aes(x = Marital_Status)) +
+  geom_bar(fill = 'cadetblue4') +
+  theme_minimal() +
+  labs(
+    title = "Bar Chart of Marital Status",
+    ylab = "Count",
+    fill = "Marital Status"
+  )
+```
+
+Alone and Single will be combined; Absurd and Yolo observations will be dropped from the data set.
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+levels(dt$Marital_Status)
+
+# Change "Alone" to "Single"
+levels(dt$Marital_Status)[levels(dt$Marital_Status) == "Alone"] <- "Single"
+
+# Check the levels again to verify the change
+levels(dt$Marital_Status)
+
+# Remove observations where Marital_Status is "Absurd" or "YOLO"
+dt <- dt[!(dt$Marital_Status %in% c("Absurd", "YOLO")), ]
+dt$Marital_Status <- droplevels(dt$Marital_Status)
+
+
+# Check the unique values again to verify the removal
+unique(dt$Marital_Status)
+```
+
+Re-run the plot for Marital Status.
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+ggplot(data = dt, aes(x = Marital_Status)) +
+  geom_bar(fill = 'cadetblue4') +
+  theme_minimal() +
+  labs(
+    title = "Bar Chart of Marital Status",
+    ylab = "Count",
+    fill = "Marital Status"
+  )
+```
+
+## Income
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+ggplot(dt, aes(x = Income)) +
+  geom_histogram(binwidth = 1000, color = "black", fill = "skyblue", alpha = 0.7) +
+  labs(title = "Distribution of Income",
+       x = "Income",
+       y = "Frequency")+
+  scale_x_continuous(labels = dollar_format())
+```
+There seems to be outliers present in the Income feature. These outliers will be removed from the data set. 
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+Q1 <- quantile(dt$Income, 0.25)
+Q3 <- quantile(dt$Income, 0.75)
+
+IQR <- Q3 - Q1
+
+# Define the lower and upper bounds for outliers
+lower_bound <- Q1 - 1.5 * IQR
+upper_bound <- Q3 + 1.5 * IQR
+
+# Filter out outliers from the dataset
+dt <- dt[dt$Income >= lower_bound & dt$Income <= upper_bound, ]
+```
+
+Re-run the bar plot and the boxplot to visualize the changes.
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+ggplot(dt, aes(x = Income)) +
+  geom_histogram(binwidth = 1000, color = "black", fill = "skyblue", alpha = 0.7) +
+  labs(title = "Distribution of Income",
+       x = "Income",
+       y = "Frequency") +
+  scale_x_continuous(labels = dollar_format())
+
+```
+
+Factorize the Income feature to preserve more descriptive bins for business use. 
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+breaks <- seq(0, ceiling(max(dt$Income) / 10000) * 10000, by = 10000)
+breaks[1] <- 1
+
+# Create custom labels
+labels <- paste0(breaks[1:length(breaks) - 1], "-", breaks[1:length(breaks) - 1] + 9999, "k")
+
+# Adjust labels for the first interval
+labels[1] <- "1-9k"
+
+# Create income factor
+income_factor <- cut(dt$Income, breaks = breaks, labels = labels, include.lowest = TRUE)
+
+
+levels(income_factor) <- c("1-9k", "10-19k", "20-29k", "30-39k", "40-49k", "50-59k", "60-69k", "70-79k", "80k-89k", "90k-99k", "100k-109k", "110k-119k")
+
+# Add income factor to existing dataset dt
+dt$Income_Factor <- income_factor
+
+levels(dt$Income_Factor)
+```
+
+Visualization of Income
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+ggplot(data = dt, aes(x = Income_Factor)) +
+  geom_bar(fill = 'darkred') +
+  theme_minimal() +
+  labs(
+    title = "Bar Chart of Income",
+    ylab = "Count",
+    fill = "Income") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+## Household Size
+
+To reduce dimensionality in modeling, KidHome and TeenHome variables will be combined into a Number of Kids variable and then removed from the data set. 
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+dt$NumKids <- dt$Teenhome + dt$Kidhome
+
+ggplot(data = dt, aes(x = NumKids)) +
+  geom_bar(fill = 'skyblue4') +
+  theme_minimal() +
+  labs(
+    title = "Bar Chart of Number of Kids",
+    ylab = "Count",
+    fill = "Income"
+  )
+
+dt<- dt[,-(5:6)]
+```
+
+
+# Creation of data subset by usable category
+
+All variables will be subset into their respective domain and joined with product categories. Because the goal is to identify cluster personalities, product category subsets will be analyzed through people and promotional attributes. 
+
+```{r,cache= TRUE, warning=FALSE, message = FALSE}
+people_attrs <- dt[, c("Age", "Education", "Marital_Status", "Income_Factor", "NumKids",
+                              "Customer_Duration", "Recency", "Complain")]
+product_attrs <- dt[, c("MntWines", "MntFruits", "MntMeatProducts", 
+                               "MntFishProducts", "MntSweetProducts", "MntGoldProds")]
+promotion_attrs <- dt[, c("NumDealsPurchases", "AcceptedCmp1", "AcceptedCmp2", 
+                                 "AcceptedCmp3", "AcceptedCmp4", "AcceptedCmp5", "Response")]
+place_attrs <- dt[, c("NumWebPurchases", "NumCatalogPurchases", "NumStorePurchases")]
+```
+
+```{r, cache= TRUE, warning=FALSE, message = FALSE}
+# wine data frame
+Wine <- cbind(dt$MntWines, people_attrs, promotion_attrs)
+
+# Food data frame
+MntFood <- dt$MntFishProducts + dt$MntMeatProducts + dt$MntFruits
+Food <- cbind(MntFood, people_attrs, promotion_attrs)
+
+# Sweets data frame
+Sweet <- cbind(dt$MntSweetProducts, people_attrs, promotion_attrs)
+
+# Sweets dataf rame
+Gold <- cbind(dt$MntGoldProds, people_attrs, promotion_attrs)
+```
+
+# Correlation Plot
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+
+# Compute correlation matrix
+cor_matrix <- cor(dt[, sapply(dt, is.numeric)], use="complete.obs")
+
+# Plot correlation matrix
+corrplot(cor_matrix, method="circle")
+```
+
+Z_Cost Contact and Z_-_Revenue have 0 variance and will be removed from the data set. In the correlation plot, there are several strong, positive correlations between income and the amount spent on Wines and Meat products, as well as store and catalog purchaes. Interestingly, there is a strong, negative relationship between income and number of web visits. 
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+dt<- dt[,-(23:24)]
+
+# Compute correlation matrix
+cor_matrix <- cor(dt[, sapply(dt, is.numeric)], use="complete.obs")
+
+# Plot correlation matrix
+corrplot(cor_matrix, method="circle")
+```
+
+# Modeling
+
+## K-Means
+
+K-Means is, simply put, an unsupervisored clustering algorithm that groups like data so that the difference within groups is minimized, and the difference between groups is maximized. In order to prepare for k-means clustering, and because the algorithm only works with numeric variables, the data frame will be pre-processed by centering and scaling the data. As a result, the clusters will be based on the following variables:
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+
+dt%>% select(-1) %>% select(is.numeric) %>% colnames()
+
+```
+
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+dt_preprocessed <- dt[,-c(1,3)]
+dt_preprocessed_values <- preProcess(dt_preprocessed[,c(3:14,22,23,25)], method = c('center','scale'))
+dt_scaled <- predict(dt_preprocessed_values, dt_preprocessed[,c(3:14,22,23,25)])
+```
+
+### Elbow Plot
+
+To determine the optimal number of clusters, the elbow plot will be used. The resulting optimal cluster value is 3.
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+
+fviz_nbclust(dt_scaled, kmeans, method = 'wss')
+```
+
+### Initial Cluster Visualization
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+# Set a seed for reproducibility
+set.seed(2024)
+
+# Apply k-means clustering with the chosen number of clusters (e.g., 3)
+k <- 3
+kmeans_result <- kmeans(dt_scaled, centers = k, nstart = 25)
+
+# Add the cluster assignments to the original data
+dt$Cluster <- as.factor(kmeans_result$cluster)
+
+fviz_cluster(kmeans_result, dt_scaled, geom = 'point', outlier.pointsize = 10, ellipse.type = 'norm')
+```
+
+## Exploration of Clusters
+
+On initial inspection of clusters, cluster 2 has the most customers with 1038.
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+# Size of Cluster
+dt %>% group_by(Cluster) %>% summarise(Size = n()) %>% 
+  ggplot(aes(Cluster, Size, fill = Cluster, label = Size)) + 
+  geom_col() + 
+  geom_text(position = position_stack(vjust = .5)) +
+  labs(title = "Size of Clusters")
+```
+
+### Exploring Amount Spent per Cluster
+
+Despite it's size, Cluster 2 spend the least amount of money on products, where cluster 1 spend the overwhelming majority. 
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+# Total Spending Data Frame
+dt$Total_spending <- rowSums(dt[,grep("Mnt", names(dt))])
+
+spending <- dt%>% group_by(Cluster) %>% summarize(Average_Spending = sum(Total_spending)/ n(), Total_spending = sum(Total_spending))
+
+
+# Total Spending per Cluster
+ggplot(spending, aes(Cluster, Total_spending, fill = Cluster, label = Total_spending)) + 
+  geom_col() +
+  labs(title = "Total Spending by Clusters", x = "Cluster", y = "Total Spent") + 
+  scale_y_continuous(labels = dollar_format()) +
+  geom_text(aes(label = dollar_format()(Total_spending)), position = position_stack(vjust = .5))
+
+# Average Spending per Cluster
+ggplot(spending, aes(Cluster, Average_Spending, fill = Cluster, label = Average_Spending)) + 
+  geom_col() +
+  labs(title = "Average Spending by Clusters", x = "Cluster", y = "Average Spent") + 
+  scale_y_continuous(labels = dollar_format()) +
+  geom_text(aes(label = dollar_format()(Average_Spending)),position = position_stack( vjust = .5))
+```
+
+### Income per Cluster
+
+Cluster 1 has the high maximum and median income, where as cluster 2, the largest sized cluster, has the smallest. This could be an influential reason as to their limited spending habits, and why Cluster 1 has the highest spending and spending average. 
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+# Boxplot of Income per Cluster
+ggplot(dt, aes(Cluster, Income)) + 
+  geom_boxplot() + 
+  scale_y_continuous(labels = dollar_format())
+```
+
+### Number of Kids and Spending
+
+Furthering the income analysis above, by visualizing the number of kids alongside total spending, we can see that while clusters 2 and 3 have less income, they also have dependent as a financial concern, potentially limiting their spendable income and highlighting their price sensitivity. 
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+ggplot(dt, aes(NumKids, fill = Cluster)) + geom_bar(position = 'dodge') +
+  labs(title = 'Count of Number of Kids', y = 'Customer Count', x = 'Number of Kids') +
+  facet_wrap(~Cluster)
+
+ggplot(dt, aes(NumKids, Total_spending, fill = Cluster)) + 
+  geom_col() +
+  scale_y_continuous(labels = label_dollar()) +
+  labs(title = 'Total Spending per the Number of Kids', y = 'Total Spending', x='Number of Kids')
+```
+
+
+### recency since Last Purchase
+
+There are marginal differences in how recently customers of each cluster ordered. However, when comparing the cluster average to the average across all clusters, we can see that cluster 2 has more customers in it who have purchase more frequently than the average. Looking at the histogram faceted by Cluster, we can see Cluster 2 has a multi-modal distribution with peaks around the tails of values which is not as drastically present in cluster 1 and 3, which could be skewing the boxplot analysis. Accounting for size, this could indicate a shifting trend in more effective targeted advertisement subsequently increasing average spent per cluster average; however, Cluster 2 has the lowest median income which could be the overall limiting factor. 
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+# Cluster Recency - marginal difference
+ggplot(dt, aes(Cluster, Recency)) + 
+  geom_boxplot()
+
+
+avg_recency <- mean(dt$Recency)
+dt_recency <- dt[,c('Cluster', 'Recency')]
+dt_recency$total_above <- ifelse(dt_recency$Recency < avg_recency,1,0)
+
+dt_recency %>% group_by(Cluster)%>% summarize(total_above = sum(total_above), Percentage = sum(total_above) / n()) %>% 
+  ggplot(aes(Cluster, Percentage, fill = Cluster, label = Percentage)) +
+  geom_col() +
+  geom_text(aes(label = label_percent()(Percentage)), position =position_stack(vjust = .5)) +
+  labs(title = '% of Cluster Customers who purchased more recently than the average', y= 'Percentage', subtitle = 'Average Time Since Last Purchase: 49 days') +
+  scale_y_continuous(labels = label_percent())
+
+dt_recency %>% group_by(Cluster)%>% summarize(total_above = sum(total_above), Percentage = sum(total_above) / n()) %>% 
+  ggplot(aes(Cluster, total_above, fill = Cluster, label = total_above)) +
+  geom_col() +
+  geom_text(position =position_stack(vjust = .5)) +
+  labs(title = 'Amount of Customers who purchased more recently than the average', y= 'Total Customers', subtitle = 'Average Time Since Last Purchase: 49 days')
+
+
+ggplot(dt, aes(Recency, fill = Cluster)) + geom_histogram() + facet_wrap(~Cluster)
+```
+
+### Responsiveness to Targeted Campaigns
+
+Cluster 1 has been the most receptive to campaigns, with over 20% of the cluster accepting each of the last 2 campaigns. Cluster 2 has been largely non-responsive; accepting under 5% in 4 of the 6 campaigns. However, over 10% accepted the most recent campaign which, depending on timing, could explain the cluster's spike in recency since last purchase. 
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+# Campaigns Accepted as a percentage of Cluster
+melted_DT <- dt[, c( 28, 23, 21:17)]
+melted_DT <- melt(melted_DT, id.var = 'Cluster')
+
+# Ensure the 'value' column is numeric
+melted_DT$value <- as.numeric(melted_DT$value)
+
+melted_DT <- melted_DT %>% 
+  group_by(Cluster, variable) %>% 
+  summarise(value = sum(value))
+
+clusterTotal <- dt %>% 
+  group_by(Cluster) %>% 
+  summarize(total = n())
+
+melted_DT <- merge(melted_DT, clusterTotal, by.x = 'Cluster', by.y = 'Cluster', all.x = TRUE)
+melted_DT$percentage <- melted_DT$value / melted_DT$total
+
+melted_DT$Cluster <- as.factor(melted_DT$Cluster)
+
+order <- c('AcceptedCmp1', 'AcceptedCmp2', 'AcceptedCmp3', 'AcceptedCmp4', 'AcceptedCmp5', 'Response')
+
+ggplot(melted_DT, aes(factor(variable, levels = order), percentage)) + 
+  geom_col(position = 'dodge', aes(fill = Cluster)) + 
+  facet_wrap(~Cluster) + 
+  labs(x = 'Campaign (in order)', title = 'Campaigns Accepted as a Percentage of Cluster', y='Percentage') + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0))+
+  scale_y_continuous(labels = label_percent())
+```
+
+### Product Category Purchase Totals by Cluster
+
+Wines and meat products account for the largest sum of sales, with clusters 1 and 3 accounting for the majority, respectively. Across all categories, Cluster 2, while being the largest cluster, purchases the least amount in all categories. By percentage, 75% of Cluster 2 customers purchased more luxurious products like Fish, Gold, and Sweets. This indicates a willingness to purchase the product but could be excluded from purchasing more based on their income. Respective to the cluster size, one way to boost total sales in these categories is to offer more price conscious offerings or targeted deals. 
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+
+# Product Category Purchase Totals by Cluster
+
+product_attrs_cluster<-cbind(Cluster = as.factor(kmeans_result$cluster), product_attrs)
+
+product_attrs_cluster_longer <- pivot_longer(product_attrs_cluster, MntWines:MntGoldProds)
+
+product_attrs_cluster <- product_attrs_cluster_longer%>% group_by(Cluster, name) %>% summarise(value = sum(value))
+
+colnames(product_attrs_cluster)[2] <- 'Category'
+product_attrs_cluster$Cluster<- as.factor(product_attrs_cluster$Cluster)
+
+
+product_attrs_cluster_longer$Purchased <- ifelse(product_attrs_cluster_longer$value >0, 1,0)
+
+ggplot(product_attrs_cluster, aes(Category, value, fill = Cluster, label = value)) +
+  geom_col(position = 'stack') + 
+  labs(title = 'Product Category Purchase Totals by Cluster') +
+  geom_text(size = 3, position = position_stack(vjust = .5)) +
+  scale_y_continuous(labels = label_comma()) + 
+  scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+  theme_minimal()
+
+product_attrs_cluster_longer %>% group_by(Cluster, name) %>% summarise(Total_Purchased = sum(Purchased), Size = n(), Percent_Purchased = sum(Purchased) /n()) %>% ggplot(aes(name, Percent_Purchased, fill = Cluster)) +
+  geom_col(position = 'dodge') +
+  scale_y_continuous(label = label_percent()) +
+  labs(title = 'Percent of Cluster Purchasing Product Categories')+
+  theme_minimal()
+```
+
+### Place of Purchase per Customer
+
+Store and Web purchases account for the most purchases, respectively. Additionally, this is the trend across all of the clusters with the exception of Cluster 1, who has more purchases through the catalog than the web. While there are no previous metrics to base this off of, almost 100% of cluster 2 visited the website in the last month. This is a good indication that they are not inactive customers. It is worth noting that almost 25% of cluster 1 has not visited the website in the last month. Their preference to the catalog over the web could suggest that the website is not showcasing the products cluster 1 is looking to purchase, in their preferred manner. Given this cluster is accounts for the most sales, a redesign of the website could be beneficial for sustaining their engagement.  Alternatively, the catalog could be a way of keeping the company fresh in their minds in the event the cluster does not check promotional emails. 
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+
+# Place of Purchase per Cluster
+
+place_attrs_cluster <- cbind(Cluster = kmeans_result$cluster, place_attrs)
+place_attrs_cluster <- pivot_longer(place_attrs_cluster, 2:4)
+
+place_attrs_cluster <- place_attrs_cluster%>% group_by(Cluster, name) %>% summarise(value = sum(value))
+
+colnames(place_attrs_cluster)[2] <- 'Place'
+place_attrs_cluster$Cluster<- as.factor(place_attrs_cluster$Cluster)
+
+ggplot(place_attrs_cluster, aes(Place, value, fill = Cluster, label = value)) +
+  geom_col(position = 'stack') + 
+  labs(title = 'Product Category Purchase Totals by Cluster') +
+  geom_text(size = 3, position = position_stack(vjust = .5)) +
+  scale_y_continuous(labels = label_comma()) + 
+  scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+  theme_minimal()
+
+ggplot(place_attrs_cluster, aes(Cluster, value, fill = Place, label = value)) +
+  geom_col(position = 'stack') + 
+  labs(title = 'Product Category Purchase Totals by Cluster') +
+  geom_text(size = 3, position = position_stack(vjust = .5)) +
+  scale_y_continuous(labels = label_comma()) + 
+  scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+  theme_minimal()
+
+WebVisits_dt <- data.frame(Cluster = dt$Cluster, Web_Visits = dt$NumWebVisitsMonth)
+WebVisits_dt$Visited <- ifelse(WebVisits_dt$Web_Visits>1,1,0)
+WebVisits_dt %>% group_by(Cluster) %>% summarise(Total_Visited = sum(Visited), n(), Percent_Visited = sum(Visited)/n()) %>%
+  ggplot(aes(Cluster, Percent_Visited, label = Percent_Visited, fill = Cluster)) +
+  geom_col() +
+  scale_y_continuous(labels = label_percent()) +
+  geom_text(aes(label = label_percent()(Percent_Visited)), position = position_stack(vjust = .5))+
+  labs(title = 'Percentage of Cluster Visited the Website Last Month',y='Percent Visited')
+```
+
+### Total Spending and Deals Purchased
+
+We can see a positive relationship between the amount spent and a customers income. Knowing income is not equally distributed across all clusters, we can see the highest earners in Cluster 1 do not purchases as many deals as clusters 2 and 3. As a stacked chart, we can see the parabolic relationship; where as deals increases as income increased until after around $59k, where as income increases, deals decreases. This indicates price sensitivity of the clusters and customer groups. Further data is needed for analysis on how the deals affects product category purchases in total, and within clusters. 
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+# Cluster Income vs Total Amount Spent
+
+ggplot(dt, aes(Income, Total_spending, col = Cluster)) + geom_point() + labs(title = 'Scatter Plot of Income vs Total Amount Spent',y = 'Total Amount Spent') + theme_minimal()
+
+ggplot(dt, aes(Cluster, NumDealsPurchases, fill = Cluster, labels = NumDealsPurchases)) + geom_col() + labs(title = 'Number of Deals Purchased', y='Number of Deals Purchased') + theme_minimal()
+
+
+ggplot(dt, aes(Income_Factor, NumDealsPurchases, fill = Cluster)) + geom_col() + labs(title = 'Scatter Plot of Income vs Number of Deals Purchased',x = 'Number of Deals Purchased') + theme_minimal()
+```
+
+## Association Rules
+
+Association Rules are a data mining technique to uncover hidden relationships between variables. High purchases for Food, Wine, Sweet, and Gold product categories will be mined based on "High" being calcualated as the top quartile in that spending category. The Apriori algorithm will be used in this analysis. 
+
+### Food Association Rules
+
+Looking at the first 5 rules, by lift, we can see that having an income of $80-89k is a common feature across the rules. Additionally worth noting, A high food spender would have purchased 1 deal and not accepted Campaigns 2, 3, or 4. This is an important discovery as it shows an ineffective target if that was the intent of the campaign. 
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+# Define the breaks for discretization based on quartiles and max value
+quantile(Food$MntFood)
+breaks <- c(-Inf, 25, 91, 356, Inf)
+
+# Create labels for the categories
+labels <- c("Very Low", "Low", "Medium", "High")
+
+# Discretize the MntWine variable into categories
+Food$MntFood_Category <- cut(Food$MntFood, breaks = breaks, labels = labels, include.lowest = TRUE)
+```
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+food_rules <- sort(apriori(Food[,2:17], parameter = list(supp = 0.05, conf = 0.8, maxlen = 5),
+                      appearance = list(default = "lhs", rhs = c("MntFood_Category=High"))), by = 'lift')
+inspect(food_rules[1:5,])
+
+plot(food_rules, method = "graph", control = list(max = 5))
+```
+
+### Wine Rules
+
+To be a high spender in wine, the most common association across the first 5 rules (by lift), is that the customer would have accepted campaign 5. If the
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+# Define the breaks for discretization based on quartiles and max value
+quantile(Wine$`dt$MntWines`)
+breaks <- c(-Inf, 24, 176, 507, Inf)
+
+# Create labels for the categories
+labels <- c("Very Low", "Low", "Medium", "High")
+
+Wine$`dt$MntWines`<-as.numeric(Wine$`dt$MntWines`)
+
+# Discretize the MntWine variable into categories
+Wine$MntWine_Category <- cut(dt$MntWines, breaks = breaks, labels = labels, include.lowest = TRUE)
+```
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+wine_rules <- sort(apriori(Wine[,2:17], parameter = list(supp = 0.05, conf = 0.8, maxlen = 5),
+                      appearance = list(default = "lhs", rhs = c("MntWine_Category=High"))), by = 'lift')
+inspect(wine_rules[1:5])
+
+plot(wine_rules, method = "graph", control = list(max = 5))
+```
+
+### Sweet Rules
+
+The most common association rules for Sweet are having an income between $70-89k. It is worth noting that, in these rules, we only have less than 70% confidence that they would lead to high spending in sweets.
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+# Define the breaks for discretization based on quartiles and max value
+quantile(Sweet$`dt$MntSweetProducts`)
+breaks <- c(-Inf, 1, 8, 34, Inf)
+
+# Create labels for the categories
+labels <- c("Very Low", "Low", "Medium", "High")
+
+Sweet$`dt$MntSweetProducts`<-as.numeric(Sweet$`dt$MntSweetProducts`)
+
+# Discretize the MntSweet variable into categories
+Sweet$MntSweet_Category <- cut(Sweet$`dt$MntSweetProducts`, breaks = breaks, labels = labels, include.lowest = TRUE)
+```
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+sweet_rules <- sort(apriori(Sweet[,2:17], parameter = list(supp = 0.05, conf = 0.6, maxlen = 5),
+                      appearance = list(default = "lhs", rhs = c("MntSweet_Category=High"))), by = 'lift')
+inspect(sweet_rules[1:5])
+
+plot(sweet_rules, method = "graph", control = list(max = 5))
+```
+
+### Gold Rules
+
+When sorting by lift, the most common association is that they have an income between $70-79k; however, much like with sweets, the confidence in these associations leading to high spenders in gold is below 50%.
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+# Define the breaks for discretization based on quartiles and max value
+quantile(Gold$`dt$MntGoldProds`)
+breaks <- c(-Inf, 9, 25, 56, Inf)
+
+# Create labels for the categories
+labels <- c("Very Low", "Low", "Medium", "High")
+
+Gold$`dt$MntGoldProds`<-as.numeric(Gold$`dt$MntGoldProds`)
+
+# Discretize the MntSweet variable into categories
+Gold$MntGold_Category <- cut(Gold$`dt$MntGoldProds`, breaks = breaks, labels = labels, include.lowest = TRUE)
+```
+
+```{r, echo = FALSE, cache= TRUE, warning=FALSE, message = FALSE}
+gold_rules <- sort(apriori(Gold[,2:17], parameter = list(supp = 0.05, conf = 0.3, maxlen = 5),
+                      appearance = list(default = "lhs", rhs = c("MntGold_Category=High"))), by = 'lift')
+inspect(gold_rules[1:5,])
+
+plot(gold_rules, method = "graph", control = list(max = 10))
+```
+
+
+
+# Conclusion
+
+Given the disparity of income and spending across clusters and product categories, a price sensitivity analysis should be conducted to determine how effective the item offerings are translating to sales. By the percentages, members of all clusters are purchasing products across all product categories; as such, the business should acknowledge the size of the clusters and the potential that they might not be offering products at the correct price point to entice the sales across their customer base. Additionally, deal purchases are highest around the mean income; to further drive sales, promotional offerings need to be more directly targeted at the consumers with respect to their cluster and income. The high earners and spenders of Cluster 1 show to not be interacting with the web design despite each customer spending, on average, just over $1300. By redesigning the website to be more catering to their needs, the duration since their last purchase can be shortened and perhaps, increase in frequency as they would not be waiting on catalog mail before purchasing. Additionally, with the more price sensitive/income limited customers in clusters 2 and 3, we see the largest volume of deals purchased. A limited deal of a lower priced luxury item could be offered to spur sales from them. This maintains brand image and does not dilute quality, while maintaining an active customer base. Tailored campaigns focusing on essential products and cost-saving offers could better engage low-income customers, enhancing their loyalty and satisfaction.
